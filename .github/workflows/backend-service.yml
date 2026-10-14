@@ -1,0 +1,162 @@
+# Template compartilhado para serviços de backend (.NET em contêiner).
+# Consumido pelo .github/workflows/ci.yml de cada aplicação via "uses:" (workflow reutilizável).
+#
+# Etapas: testes → Trivy no código → build linux/arm64 → push no GHCR → Trivy na imagem
+#         → commit da nova tag em <overlay-path>/kustomization.yaml do repositório da plataforma
+#         → o Argo CD sincroniza. A esteira nunca acessa o cluster.
+name: backend-service
+
+on:
+  workflow_call:
+    inputs:
+      platform-repository:
+        description: "Repositório GitOps da plataforma (<owner>/tcc-platform)"
+        type: string
+        required: true
+      overlay-path:
+        description: "Overlay da aplicação no repositório da plataforma (ex.: apps/catalogo-api)"
+        type: string
+        required: true
+      dotnet-version:
+        type: string
+        default: "9.0.x"
+      test-command:
+        description: "Comando de testes; vazio pula a etapa"
+        type: string
+        default: "dotnet test --configuration Release"
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+      build-context:
+        type: string
+        default: "."
+      docker-build-args:
+        description: "Build args, um por linha (CHAVE=valor)"
+        type: string
+        default: ""
+      enable-trivy-filesystem-scan:
+        type: boolean
+        default: true
+      enable-trivy-image-scan:
+        type: boolean
+        default: true
+      enable-deploy:
+        description: "false = só testa e analisa (ex.: pull requests)"
+        type: boolean
+        default: true
+    secrets:
+      platform-token:
+        description: "Token com Contents: write no repositório da plataforma"
+        required: false
+
+jobs:
+  test:
+    if: inputs.test-command != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+      - name: Testes
+        run: ${{ inputs.test-command }}
+
+  build:
+    needs: test
+    # roda mesmo quando "test" foi pulado, mas não quando falhou
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Nome e tag da imagem
+        id: meta
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy — código (vulnerabilidades e segredos; falha em CRITICAL)
+        if: inputs.enable-trivy-filesystem-scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # QEMU: estágios do Dockerfile que rodam na arquitetura de destino (arm64)
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push (linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build-context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: linux/arm64
+          build-args: ${{ inputs.docker-build-args }}
+          push: ${{ inputs.enable-deploy }}
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy — imagem (falha em CRITICAL com correção disponível)
+        if: inputs.enable-trivy-image-scan && inputs.enable-deploy
+        uses: aquasecurity/trivy-action@0.28.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  update-manifest:
+    needs: build
+    if: inputs.enable-deploy
+    runs-on: ubuntu-latest
+    concurrency:
+      group: update-manifest-${{ inputs.platform-repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.platform-repository }}
+          token: ${{ secrets.platform-token }}
+          path: platform
+
+      - name: Gravar a tag no overlay
+        working-directory: platform
+        env:
+          FILE: ${{ inputs.overlay-path }}/kustomization.yaml
+          IMAGE: ${{ needs.build.outputs.image }}
+          TAG: ${{ needs.build.outputs.tag }}
+          APP: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          [ -f "$FILE" ] || { echo "::error::$FILE não existe no repositório da plataforma"; exit 1; }
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for tentativa in 1 2 3; do
+            # bloco "images:" do overlay: - name: <IMAGE> / newTag: <tag>
+            sed -i -E "/name: ${IMAGE//\//\\/}\$/,/newTag:/ s|^(\s*newTag:).*|\1 ${TAG}|" "$FILE"
+            git add "$FILE"
+            git diff --cached --quiet && { echo "Tag já estava em ${TAG}"; exit 0; }
+            git commit -m "deploy(${APP}): ${TAG}"
+            git push && exit 0
+            echo "Push rejeitado; atualizando e tentando de novo (${tentativa})"
+            git fetch origin && git reset --hard "origin/$(git rev-parse --abbrev-ref HEAD)"
+          done
+          exit 1
