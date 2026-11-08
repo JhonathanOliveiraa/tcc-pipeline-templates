@@ -138,7 +138,9 @@ jobs:
 
   update-manifest:
     needs: build
-    if: inputs.enable-deploy
+    # always(): sem ele, o job é pulado quando "test" foi pulado (test-command vazio), mesmo com o
+    # build aprovado — o GitHub propaga o "skipped" de qualquer ancestral.
+    if: always() && needs.build.result == 'success' && inputs.enable-deploy
     runs-on: ubuntu-latest
     concurrency:
       group: update-manifest-${{ inputs.platform-repository }}
