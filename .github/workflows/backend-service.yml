@@ -69,6 +69,7 @@ jobs:
     outputs:
       image: ${{ steps.meta.outputs.image }}
       tag: ${{ steps.meta.outputs.tag }}
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -100,7 +101,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Estágio de compilação em $BUILDPLATFORM (amd64, nativo) com publicação cruzada para arm64;
+      # o QEMU só executa os estágios finais que tenham RUN (as imagens das apps não têm).
       - name: Build e push (linux/arm64)
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.build-context }}
@@ -112,13 +116,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Resumo
+        if: inputs.enable-deploy
+        run: |
+          {
+            echo "### Imagem publicada"
+            echo ""
+            echo "\`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}@${{ steps.push.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Trivy — imagem (falha em CRITICAL com correção disponível)
         if: inputs.enable-trivy-image-scan && inputs.enable-deploy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
           TRIVY_PLATFORM: linux/arm64
         with:
-          image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          image-ref: ${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}
           severity: CRITICAL
           ignore-unfixed: true
           exit-code: "1"
@@ -137,24 +150,32 @@ jobs:
           token: ${{ secrets.platform-token }}
           path: platform
 
-      - name: Gravar a tag no overlay
+      # Grava tag (legível) e digest (imutável) no bloco images: do overlay. Com digest, o Kustomize
+      # renderiza <imagem>:<tag>@sha256:..., e o kubelet baixa exatamente o conteúdo construído aqui,
+      # mesmo que alguém reescreva a tag no GHCR (tags de registro são mutáveis).
+      - name: Gravar a imagem no overlay
         working-directory: platform
         env:
           FILE: ${{ inputs.overlay-path }}/kustomization.yaml
           IMAGE: ${{ needs.build.outputs.image }}
           TAG: ${{ needs.build.outputs.tag }}
+          DIGEST: ${{ needs.build.outputs.digest }}
           APP: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
           [ -f "$FILE" ] || { echo "::error::$FILE não existe no repositório da plataforma"; exit 1; }
+          [ -n "$DIGEST" ] || { echo "::error::build não devolveu o digest da imagem"; exit 1; }
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           for tentativa in 1 2 3; do
-            # bloco "images:" do overlay: - name: <IMAGE> / newTag: <tag>
-            sed -i -E "/name: ${IMAGE//\//\\/}\$/,/newTag:/ s|^(\s*newTag:).*|\1 ${TAG}|" "$FILE"
+            yq -e '.images[] | select(.name == strenv(IMAGE))' "$FILE" > /dev/null \
+              || { echo "::error::$FILE não tem images[].name == $IMAGE"; exit 1; }
+            yq -i '(.images[] | select(.name == strenv(IMAGE))) |= (.newTag = strenv(TAG) | .digest = strenv(DIGEST))' "$FILE"
             git add "$FILE"
-            git diff --cached --quiet && { echo "Tag já estava em ${TAG}"; exit 0; }
-            git commit -m "deploy(${APP}): ${TAG}"
+            git diff --cached --quiet && { echo "Overlay já estava em ${TAG}"; exit 0; }
+            # A esteira só pode alterar o próprio kustomization.yaml do overlay.
+            [ "$(git diff --cached --name-only)" = "$FILE" ] || { echo "::error::alteração fora de $FILE"; exit 1; }
+            git commit -m "deploy(${APP}): ${TAG}" -m "${IMAGE}@${DIGEST}"
             git push && exit 0
             echo "Push rejeitado; atualizando e tentando de novo (${tentativa})"
             git fetch origin && git reset --hard "origin/$(git rev-parse --abbrev-ref HEAD)"
